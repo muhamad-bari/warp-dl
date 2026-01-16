@@ -1,11 +1,9 @@
 package downloader
 
 import (
-	"context"
 	"net/http"
 	"os"
 	"sync/atomic"
-	"time"
 )
 
 // Config holds the configuration for the download
@@ -13,6 +11,7 @@ type Config struct {
 	URL         string
 	Concurrency int
 	OutputName  string
+	UseDoH      bool
 }
 
 // Stats holds real-time statistics

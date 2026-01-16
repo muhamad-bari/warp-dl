@@ -14,6 +14,7 @@ import (
 var (
 	concurrency int
 	output      string
+	useDoH      bool
 )
 
 var rootCmd = &cobra.Command{
@@ -29,6 +30,7 @@ var rootCmd = &cobra.Command{
 func init() {
 	rootCmd.Flags().IntVarP(&concurrency, "concurrent", "c", 16, "Number of concurrent connections")
 	rootCmd.Flags().StringVarP(&output, "output", "o", "", "Output filename")
+	rootCmd.Flags().BoolVarP(&useDoH, "doh", "s", true, "Use DNS over HTTPS (Anti-ISP Block)")
 }
 
 func main() {
@@ -43,6 +45,7 @@ func runDownload(url string) {
 		URL:         url,
 		Concurrency: concurrency,
 		OutputName:  output,
+		UseDoH:      useDoH,
 	}
 
 	engine := downloader.NewEngine(cfg)

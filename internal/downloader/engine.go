@@ -2,51 +2,56 @@ package downloader
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
 
 // NewEngine creates a new download engine
 func NewEngine(cfg Config) *Engine {
+	client := &http.Client{
+		Timeout: 0,
+	}
+	
+	if cfg.UseDoH {
+		client.Transport = NewDoHTransport()
+	} else {
+		// Even without DoH, we want to skip TLS verification as requested
+		client.Transport = &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			TLSNextProto:    map[string]func(string, *tls.Conn) http.RoundTripper{},
+			ForceAttemptHTTP2: false,
+		}
+	}
+
 	return &Engine{
 		Config: cfg,
 		Stats:  &Stats{},
-		Client: &http.Client{
-			Timeout: 0, // No timeout for large downloads, individual reads handled by context
-		},
+		Client: client,
 	}
 }
 
 // Start initiates the download process
 func (e *Engine) Start(ctx context.Context) error {
-	// 1. Probe the URL
-	req, err := http.NewRequestWithContext(ctx, "HEAD", e.Config.URL, nil)
-	if err != nil {
-		return fmt.Errorf("failed to create request: %w", err)
-	}
-
-	resp, err := e.Client.Do(req)
+	// 1. Probe the URL (Try HEAD first, then GET)
+	totalBytes, resumable, err := e.probeURL(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to probe URL: %w", err)
 	}
-	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("server returned non-200 status: %s", resp.Status)
-	}
-
-	e.Stats.TotalBytes = resp.ContentLength
-	e.IsResumable = resp.Header.Get("Accept-Ranges") == "bytes" && e.Stats.TotalBytes > 0
+	e.Stats.TotalBytes = totalBytes
+	e.IsResumable = resumable && e.Stats.TotalBytes > 0
 
 	// Handle output filename
 	if e.Config.OutputName == "" {
-		// Try to get filename from Content-Disposition or URL
-		// Simple fallback for now
 		e.Config.OutputName = filepath.Base(e.Config.URL)
 	}
 
@@ -56,9 +61,9 @@ func (e *Engine) Start(ctx context.Context) error {
 	} else {
 		// Fallback to single connection
 		e.Parts = []*Part{{
-			ID:    0,
-			Start: 0,
-			End:   e.Stats.TotalBytes - 1,
+			ID:       0,
+			Start:    0,
+			End:      e.Stats.TotalBytes - 1,
 			TempPath: fmt.Sprintf("%s.part0", e.Config.OutputName),
 		}}
 	}
@@ -92,6 +97,55 @@ func (e *Engine) Start(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+func (e *Engine) probeURL(ctx context.Context) (int64, bool, error) {
+	// Try HEAD first
+	req, err := http.NewRequestWithContext(ctx, "HEAD", e.Config.URL, nil)
+	if err != nil {
+		return 0, false, err
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
+	resp, err := e.Client.Do(req)
+	if err == nil && resp.StatusCode == http.StatusOK {
+		defer resp.Body.Close()
+		return resp.ContentLength, resp.Header.Get("Accept-Ranges") == "bytes", nil
+	}
+	if resp != nil {
+		resp.Body.Close()
+	}
+
+	// If HEAD fails, try GET with Range: bytes=0-0
+	req, err = http.NewRequestWithContext(ctx, "GET", e.Config.URL, nil)
+	if err != nil {
+		return 0, false, err
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	req.Header.Set("Range", "bytes=0-0")
+
+	resp, err = e.Client.Do(req)
+	if err != nil {
+		return 0, false, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusPartialContent {
+		// Parse Content-Range: bytes 0-0/123456
+		cr := resp.Header.Get("Content-Range")
+		parts := strings.Split(cr, "/")
+		if len(parts) == 2 {
+			total, err := strconv.ParseInt(parts[1], 10, 64)
+			if err == nil {
+				return total, true, nil
+			}
+		}
+	} else if resp.StatusCode == http.StatusOK {
+		// Server ignored range, returns full content (not resumable usually, or single chunk)
+		return resp.ContentLength, false, nil
+	}
+
+	return 0, false, fmt.Errorf("probe failed with status: %s", resp.Status)
 }
 
 func (e *Engine) calculateSegments() {
@@ -142,6 +196,8 @@ func (e *Engine) downloadPart(ctx context.Context, part *Part) error {
 		return err
 	}
 
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
 	if e.IsResumable {
 		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", part.Start, part.End))
 	}
@@ -171,7 +227,6 @@ func (e *Engine) downloadPart(ctx context.Context, part *Part) error {
 		default:
 			n, err := resp.Body.Read(buf)
 			if n > 0 {
-				wErr := 0
 				nw, wErr := file.Write(buf[:n])
 				if wErr != nil {
 					return wErr
